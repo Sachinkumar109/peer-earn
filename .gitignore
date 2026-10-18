@@ -28,3 +28,10 @@ dist-ssr
 .env.local
 .env.production
 .env.development
+# Firebase local cache
+.firebase/
+
+# Private credentials
+*serviceAccount*.json
+*service-account*.json
+secrets/

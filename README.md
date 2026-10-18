@@ -2,19 +2,19 @@
 > **Decentralized Peer-to-Peer Academic Doubt-Solving & Learning Economy Platform**
 > *"Quora meets Duolingo for schools" — students learn by asking, and earn by helping.*
 
-Built for College Hackathons (24–36 hour window) using React (Vite) + Firebase (Cloud Firestore & Authentication).
+& Authentication).Built for College project(24–36 hour window) using React (Vite) + Firebase (Cloud Firestore 
 
 ---
 
 ## 🌟 Features Overview
 
 - **Student Authentication**:
-  - Sign up with Name, School/College Email, Academic Class/Level (`10th`, `11th`, `12th`, `College`).
+  - Sign up with Name, School/College Email, Academic Class/Level (`10th`, `11th`, `12th`, `College` `PG`).
   - Automatic starting grant of **100 Knowledge Points (KP)**.
   - Seamless login with email & password or 1-click test student selector.
 
 - **Post Doubts & Stake KP**:
-  - Students post questions categorized by subject (*Mathematics, Physics, Chemistry, Biology, Computer Science, English*) and class level.
+  - Students post questions categorized by subject (*Mathematics, Physics, Chemistry, Biology, Computer Science, All subjects, English*) and class level.
   - Stake Knowledge Points (held in escrow) to incentivize peers to provide quality solutions.
 
 - **Real-Time Doubt Feed & Filtering**:
@@ -63,7 +63,7 @@ Open `http://localhost:3000` in your browser.
 1. Create a project at [Firebase Console](https://console.firebase.google.com/).
 2. Enable **Authentication** (Email/Password provider).
 3. Enable **Cloud Firestore** (start in Test Mode or apply the security rules below).
-4. Copy `.env.example` to `.env`:
+4. Copy `.env` to `.env`:
    ```bash
    cp .env.example .env
    ```
@@ -107,10 +107,10 @@ service cloud.firestore {
 
 ---
 
-## 📦 Deployment to Vercel
+## 📦 Deployment to firebase
 
 1. Push this repository to GitHub or GitLab.
-2. Go to [Vercel Dashboard](https://vercel.com/) and click **Add New Project**.
+2. Go to [firebase Dashboard](https://web.app/) and click **Add New Project**.
 3. Import this repository.
 4. Framework Preset: **Vite**
 5. Build Command: `npm run build`
@@ -122,19 +122,19 @@ service cloud.firestore {
 
 ## 🧪 Live Demo Flow for Judges (2-Tab Walkthrough)
 
-1. **Tab 1 (Student A - Aarav)**:
+1. **Tab 1 (Student A - Aryan)**:
    - Logged in as Aarav (12th Grade).
    - Click **"Post a Doubt & Stake KP"**.
    - Select Subject: *Physics*, Class: *12th*, Stake: *25 KP*.
    - Submit the doubt. Notice KP balance deducts 25 KP immediately.
 
-2. **Tab 2 (Student B - Priya)**:
+2. **Tab 2 (Student B - sachin)**:
    - Open in an incognito window or switch persona to Priya via the top demo banner.
    - See Aarav's new doubt appear in real time on the feed!
    - Click **"Help & Earn 25 KP"**.
    - Send the solution in chat: *"According to Faraday's law, the induced emf equals -dΦ/dt..."*
 
-3. **Tab 1 (Aarav receives message in real time)**:
+3. **Tab 1 (Aryan receives message in real time)**:
    - Aarav sees Priya's answer arrive instantly without refreshing.
    - Aarav clicks **"Mark as Resolved"**.
 

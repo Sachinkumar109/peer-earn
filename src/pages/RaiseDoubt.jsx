@@ -1,3 +1,4 @@
+
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
@@ -15,18 +16,67 @@ export const RaiseDoubt = () => {
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  const [photoPreview, setPhotoPreview] = useState(null);
+  const [photoData, setPhotoData] = useState(null);
+  const [compressing, setCompressing] = useState(false);
+
   const subjects = [
     'Physics',
     'Mathematics',
     'Chemistry',
     'Biology',
     'Computer Science',
+    'IOT',
+    'Cybersecurity',
+    'AI&ML',
+    'Data Science',
+    'History',
+    'Geography',
+    'Economics',
+    'Political Science',
+    'Psychology',
+    'Sociology',
+    'Philosophy',
+    'Literature',
     'English'
   ];
 
   const quickStakes = [10, 20, 25, 50];
 
   const currentBalance = userProfile?.kpBalance ?? 0;
+
+  function handlePhotoChange(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setCompressing(true);
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const maxWidth = 700;
+        const scale = Math.min(1, maxWidth / img.width);
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+        const compressed = canvas.toDataURL('image/jpeg', 0.6);
+        setPhotoData(compressed);
+        setPhotoPreview(compressed);
+        setCompressing(false);
+      };
+      img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function removePhoto() {
+    setPhotoData(null);
+    setPhotoPreview(null);
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -53,9 +103,9 @@ export const RaiseDoubt = () => {
         text: text.trim(),
         subject,
         classLevel,
-        stakedPoints: Number(stakedPoints)
+        stakedPoints: Number(stakedPoints),
+        photoUrl: photoData || null
       });
-      // Redirect directly to the live doubt chat
       navigate(`/chat/${created.id}`);
     } catch (err) {
       setError(err.message || 'Failed to post doubt.');
@@ -77,16 +127,16 @@ export const RaiseDoubt = () => {
 
         <div className="form-container" style={{ margin: '0', maxWidth: '100%' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
-            <div 
-              style={{ 
-                width: '44px', 
-                height: '44px', 
-                background: 'var(--primary-light)', 
-                color: 'var(--primary)', 
-                borderRadius: 'var(--radius-md)', 
-                display: 'flex', 
-                alignItems: 'center', 
-                justifyContent: 'center' 
+            <div
+              style={{
+                width: '44px',
+                height: '44px',
+                background: 'var(--primary-light)',
+                color: 'var(--primary)',
+                borderRadius: 'var(--radius-md)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center'
               }}
             >
               <HelpCircle size={24} />
@@ -132,6 +182,7 @@ export const RaiseDoubt = () => {
                   <option value="11th">11th Grade</option>
                   <option value="12th">12th Grade</option>
                   <option value="college">College / Undergrad</option>
+                  <option value="postgrad">Postgraduate</option>
                 </select>
               </div>
             </div>
@@ -152,14 +203,55 @@ export const RaiseDoubt = () => {
               </span>
             </div>
 
-            {/* Staking Section */}
-            <div 
-              style={{ 
-                background: '#fffbeb', 
-                border: '1px solid #fef3c7', 
-                borderRadius: 'var(--radius-md)', 
-                padding: '16px', 
-                marginBottom: '24px' 
+            <div className="form-group">
+              <label className="form-label">Attach a photo (optional)</label>
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                onChange={handlePhotoChange}
+                className="form-input"
+              />
+              {compressing && (
+                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Compressing image...</span>
+              )}
+
+              {photoPreview && (
+                <div style={{ marginTop: '10px', position: 'relative', display: 'inline-block' }}>
+                  <img
+                    src={photoPreview}
+                    alt="Doubt attachment preview"
+                    style={{ maxWidth: '200px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={removePhoto}
+                    style={{
+                      position: 'absolute',
+                      top: '-8px',
+                      right: '-8px',
+                      background: '#ef4444',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '50%',
+                      width: '22px',
+                      height: '22px',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div
+              style={{
+                background: '#fffbeb',
+                border: '1px solid #fef3c7',
+                borderRadius: 'var(--radius-md)',
+                padding: '16px',
+                marginBottom: '24px'
               }}
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>

@@ -50,6 +50,14 @@ export const DoubtCard = ({ doubt, currentUserId }) => {
             )}
           </div>
 
+          {doubt.photoUrl && (
+            <img
+              src={doubt.photoUrl}
+              alt="Doubt attachment"
+              style={{ maxWidth: '150px', borderRadius: 'var(--radius-sm)', marginBottom: '10px', border: '1px solid var(--border-color)', display: 'block' }}
+            />
+          )}
+
           <h3 className="doubt-text">{doubt.text}</h3>
 
           <div className="doubt-meta">
@@ -69,15 +77,14 @@ export const DoubtCard = ({ doubt, currentUserId }) => {
           </div>
         </div>
 
-        {/* Bounty & CTA column */}
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px' }}>
-          <div 
-            style={{ 
-              background: '#fef3c7', 
-              color: '#b45309', 
-              padding: '6px 12px', 
-              borderRadius: 'var(--radius-md)', 
-              fontWeight: 700, 
+          <div
+            style={{
+              background: '#fef3c7',
+              color: '#b45309',
+              padding: '6px 12px',
+              borderRadius: 'var(--radius-md)',
+              fontWeight: 700,
               fontSize: '0.9rem',
               display: 'flex',
               alignItems: 'center',
@@ -92,10 +99,10 @@ export const DoubtCard = ({ doubt, currentUserId }) => {
           <Link
             to={`/chat/${doubt.id}`}
             className={`btn ${
-              doubt.status === 'resolved' 
-                ? 'btn-outline' 
-                : isAsker 
-                  ? 'btn-outline' 
+              doubt.status === 'resolved'
+                ? 'btn-outline'
+                : isAsker
+                  ? 'btn-outline'
                   : 'btn-primary'
             }`}
             style={{ fontSize: '0.85rem', padding: '7px 14px', whiteSpace: 'nowrap' }}

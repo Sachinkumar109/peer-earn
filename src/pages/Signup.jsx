@@ -21,6 +21,22 @@ export const Signup = () => {
     'Chemistry',
     'Biology',
     'Computer Science',
+    'IOT & Robotics',
+    'Artificial Intelligence',
+    'Machine Learning',
+    'Data Science',
+    'Electrical Engineering',
+    'Mechanical Engineering',
+    'Civil Engineering',
+    'Cybersecurity',
+    'History',
+    'Geography',
+    'Economics',
+    'Political Science',
+    'Psychology',
+    'Sociology',
+    'Philosophy',
+    'Literature',
     'English'
   ];
 
@@ -154,6 +170,7 @@ export const Signup = () => {
               <option value="11th">11th Grade / High School Junior</option>
               <option value="12th">12th Grade / Senior</option>
               <option value="college">College / University Undergrad</option>
+              <option value="postgrad">Postgraduate / Masters</option>
             </select>
           </div>
 

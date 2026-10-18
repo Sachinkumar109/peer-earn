@@ -1,363 +1,2022 @@
+// src/services/doubtService.js
+
 import {
   collection,
   doc,
   addDoc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
   query,
-  where,
   orderBy,
   onSnapshot,
   runTransaction,
   serverTimestamp
-} from 'firebase/firestore';
-import { db, isFirebaseConfigured } from '../firebase/config';
-import * as mockStore from './mockStorage';
+} from "firebase/firestore";
 
-/**
- * Creates a new doubt and stakes Knowledge Points (KP)
- */
-export const createDoubt = async (user, { text, subject, classLevel, stakedPoints }) => {
-  const points = Number(stakedPoints);
-  if (points <= 0) throw new Error('Staked points must be greater than 0');
-  if (user.kpBalance < points) throw new Error('Insufficient Knowledge Points (KP) balance');
+import {
+  ref as storageRef,
+  uploadBytes,
+  getDownloadURL
+} from "firebase/storage";
 
-  if (isFirebaseConfigured && db) {
-    // 1. Deduct staked points from user
-    const userRef = doc(db, 'users', user.uid);
-    await updateDoc(userRef, {
-      kpBalance: user.kpBalance - points
-    });
+import {
+  db,
+  storage,
+  isFirebaseConfigured
+} from "../firebase/config";
 
-    // 2. Create the doubt document
-    const doubtData = {
-      askerId: user.uid,
-      askerName: user.name,
+import * as mockStore from "./mockStorage";
+
+import {
+  XP_REWARDS,
+  getLevelFromXP
+} from "./progressService";
+
+import {
+  calculateAchievementUpdate
+} from "./achievementService";
+
+import {
+  KP_TRANSACTION_TYPES
+} from "./kpHistoryService";
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+const MAX_VIDEO_SIZE = 30 * 1024 * 1024;
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+const toNumber = (value, fallback = 0) => {
+  const number = Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
+};
+
+const getCreatedTime = (doubt) => {
+  if (!doubt?.createdAt) {
+    return 0;
+  }
+
+  if (typeof doubt.createdAt.toDate === "function") {
+    return doubt.createdAt.toDate().getTime();
+  }
+
+  if (typeof doubt.createdAt.toMillis === "function") {
+    return doubt.createdAt.toMillis();
+  }
+
+  if (doubt.createdAt.seconds !== undefined) {
+    return Number(doubt.createdAt.seconds) * 1000;
+  }
+
+  const parsed = new Date(doubt.createdAt).getTime();
+
+  return Number.isNaN(parsed) ? 0 : parsed;
+};
+
+const normalizeDoubtId = (doubtId) => {
+  if (
+    doubtId === undefined ||
+    doubtId === null
+  ) {
+    return "";
+  }
+
+  return String(doubtId).trim();
+};
+
+// ============================================================
+// SMART FEED PRIORITY
+// ============================================================
+
+export const getDoubtFeedPriority = (doubt) => {
+  const awardedStars = toNumber(
+    doubt?.awardedStars,
+    0
+  );
+
+  const rewardedPoints = toNumber(
+    doubt?.rewardedPoints,
+    0
+  );
+
+  const remainingPoints = toNumber(
+    doubt?.remainingPoints ??
+      doubt?.stakedPoints ??
+      0,
+    0
+  );
+
+  if (
+    doubt?.status === "resolved" ||
+    awardedStars >= 5 ||
+    remainingPoints <= 0
+  ) {
+    return 2;
+  }
+
+  if (
+    awardedStars > 0 ||
+    rewardedPoints > 0
+  ) {
+    return 1;
+  }
+
+  return 0;
+};
+
+// ============================================================
+// SMART FEED SORT
+// ============================================================
+
+export const sortDoubtsForFeed = (doubts = []) => {
+  return [...doubts].sort((a, b) => {
+    const priorityA =
+      getDoubtFeedPriority(a);
+
+    const priorityB =
+      getDoubtFeedPriority(b);
+
+    if (priorityA !== priorityB) {
+      return priorityA - priorityB;
+    }
+
+    return (
+      getCreatedTime(b) -
+      getCreatedTime(a)
+    );
+  });
+};
+
+// ============================================================
+// FILE VALIDATION
+// ============================================================
+
+const validateFile = (
+  file,
+  type = "image"
+) => {
+  if (!file) {
+    return true;
+  }
+
+  if (type === "image") {
+    if (!file.type?.startsWith("image/")) {
+      throw new Error(
+        "Please select a valid image file."
+      );
+    }
+
+    if (file.size > MAX_IMAGE_SIZE) {
+      throw new Error(
+        "Image is too large. Maximum size is 5 MB."
+      );
+    }
+  }
+
+  if (type === "video") {
+    if (!file.type?.startsWith("video/")) {
+      throw new Error(
+        "Please select a valid video file."
+      );
+    }
+
+    if (file.size > MAX_VIDEO_SIZE) {
+      throw new Error(
+        "Video is too large. Maximum size is 30 MB."
+      );
+    }
+  }
+
+  return true;
+};
+
+// ============================================================
+// UPLOAD ATTACHMENT
+// ============================================================
+
+const uploadAttachment = async (
+  file,
+  folder,
+  userId
+) => {
+  if (!file) {
+    return null;
+  }
+
+  if (!storage) {
+    throw new Error(
+      "Firebase Storage is not configured."
+    );
+  }
+
+  const safeName =
+    `${Date.now()}_${file.name || "attachment"}`;
+
+  const path =
+    `${folder}/${userId || "anonymous"}/${safeName}`;
+
+  const fileRef =
+    storageRef(storage, path);
+
+  await uploadBytes(
+    fileRef,
+    file
+  );
+
+  return await getDownloadURL(
+    fileRef
+  );
+};
+
+// ============================================================
+// CREATE DOUBT
+// ============================================================
+
+export const createDoubt = async (
+  userOrPayload,
+  maybePayload = null
+) => {
+  let userProfile;
+  let payload;
+
+  if (
+    maybePayload &&
+    typeof maybePayload === "object"
+  ) {
+    userProfile =
+      userOrPayload || {};
+
+    payload =
+      maybePayload || {};
+  } else {
+    userProfile = {};
+
+    payload =
+      userOrPayload || {};
+  }
+
+  // ----------------------------------------------------------
+  // USER
+  // ----------------------------------------------------------
+
+  const askerId =
+    payload.askerId ||
+    userProfile.uid ||
+    userProfile.id ||
+    userProfile.userId ||
+    "";
+
+  const askerName =
+    payload.askerName ||
+    userProfile.name ||
+    userProfile.displayName ||
+    userProfile.fullName ||
+    "Student";
+
+  // ----------------------------------------------------------
+  // DOUBT
+  // ----------------------------------------------------------
+
+  const text =
+    typeof payload.text === "string"
+      ? payload.text.trim()
+      : "";
+
+  const subject =
+    payload.subject ||
+    "General";
+
+  const classLevel =
+    payload.classLevel ||
+    userProfile.classLevel ||
+    "college";
+
+  // ----------------------------------------------------------
+  // KP
+  // ----------------------------------------------------------
+
+  const points =
+    Number(payload.stakedPoints);
+
+  // ----------------------------------------------------------
+  // VALIDATION
+  // ----------------------------------------------------------
+
+  if (!text || text.length < 10) {
+    throw new Error(
+      "Please provide a detailed description of your doubt (minimum 10 characters)."
+    );
+  }
+
+  if (
+    !Number.isFinite(points) ||
+    !Number.isInteger(points) ||
+    points < 5
+  ) {
+    throw new Error(
+      "Please enter a valid KP stake. Minimum stake is 5 KP."
+    );
+  }
+
+  const profileBalance =
+    Number(
+      userProfile.kpBalance ??
+      payload.kpBalance ??
+      0
+    );
+
+  // ==========================================================
+  // FIREBASE
+  // ==========================================================
+
+  if (
+    isFirebaseConfigured &&
+    db
+  ) {
+    const userRef =
+      askerId
+        ? doc(
+            db,
+            "users",
+            askerId
+          )
+        : null;
+
+    const doubtRef =
+      doc(
+        collection(
+          db,
+          "doubts"
+        )
+      );
+
+    // --------------------------------------------------------
+    // KP HISTORY DOCUMENT
+    // --------------------------------------------------------
+    //
+    // Created before the transaction so the same document
+    // can safely be written if Firestore retries the transaction.
+    //
+
+    const kpTransactionRef =
+      askerId
+        ? doc(
+            collection(
+              db,
+              "kpTransactions"
+            )
+          )
+        : null;
+
+    await runTransaction(
+      db,
+      async (transaction) => {
+        let currentBalance =
+          profileBalance;
+
+        let currentXP = 0;
+
+        let currentDoubtsRaised = 0;
+
+        let currentAchievements = {};
+
+        // ----------------------------------------------------
+        // READ USER
+        // ----------------------------------------------------
+
+        if (userRef) {
+          const userSnap =
+            await transaction.get(
+              userRef
+            );
+
+          if (userSnap.exists()) {
+            const userData =
+              userSnap.data();
+
+            currentBalance =
+              Number(
+                userData.kpBalance ?? 0
+              );
+
+            currentXP =
+              Number(
+                userData.xp ?? 0
+              );
+
+            currentDoubtsRaised =
+              Number(
+                userData.doubtsRaised ?? 0
+              );
+
+            currentAchievements =
+              userData.achievements &&
+              typeof userData.achievements ===
+                "object" &&
+              !Array.isArray(
+                userData.achievements
+              )
+                ? userData.achievements
+                : {};
+          }
+        }
+
+        // ----------------------------------------------------
+        // CHECK BALANCE
+        // ----------------------------------------------------
+
+        if (
+          !Number.isFinite(
+            currentBalance
+          ) ||
+          currentBalance < points
+        ) {
+          throw new Error(
+            `Insufficient KP balance! You have ${currentBalance} KP, but tried to stake ${points} KP.`
+          );
+        }
+
+        // ====================================================
+        // BASE XP
+        // ====================================================
+
+        const xpForRaising =
+          Number(
+            XP_REWARDS.RAISE_DOUBT ?? 0
+          );
+
+        const xpAfterRaise =
+          currentXP +
+          Math.max(
+            0,
+            xpForRaising
+          );
+
+        const newDoubtsRaised =
+          currentDoubtsRaised + 1;
+
+        const baseLevel =
+          getLevelFromXP(
+            xpAfterRaise
+          );
+
+        // ====================================================
+        // ACHIEVEMENT CHECK
+        // ====================================================
+
+        const achievementResult =
+          calculateAchievementUpdate(
+            {
+              xp: xpAfterRaise,
+
+              level:
+                baseLevel.level,
+
+              doubtsRaised:
+                newDoubtsRaised,
+
+              totalSolved:
+                0,
+
+              fiveStarRatings:
+                0,
+
+              achievements:
+                currentAchievements
+            },
+            serverTimestamp()
+          );
+
+        // ----------------------------------------------------
+        // FINAL XP
+        // ----------------------------------------------------
+
+        const finalXP =
+          achievementResult.xp;
+
+        const finalLevel =
+          getLevelFromXP(
+            finalXP
+          );
+
+        // ----------------------------------------------------
+        // NEW KP BALANCE
+        // ----------------------------------------------------
+
+        const newBalance =
+          currentBalance -
+          points;
+
+        // ----------------------------------------------------
+        // USER UPDATE
+        // ----------------------------------------------------
+
+        if (userRef) {
+          transaction.set(
+            userRef,
+            {
+              kpBalance:
+                newBalance,
+
+              xp:
+                finalXP,
+
+              level:
+                finalLevel.level,
+
+              levelName:
+                finalLevel.name,
+
+              doubtsRaised:
+                newDoubtsRaised,
+
+              achievements:
+                achievementResult.achievements,
+
+              updatedAt:
+                serverTimestamp()
+            },
+            {
+              merge: true
+            }
+          );
+        }
+
+        // ----------------------------------------------------
+        // CREATE DOUBT
+        // ----------------------------------------------------
+
+        transaction.set(
+          doubtRef,
+          {
+            askerId,
+            askerName,
+
+            text,
+            subject,
+            classLevel,
+
+            stakedPoints:
+              points,
+
+            remainingPoints:
+              points,
+
+            awardedStars: 0,
+
+            rewardedPoints: 0,
+
+            status: "open",
+
+            currentSolverId:
+              null,
+
+            currentSolverName:
+              null,
+
+            photoUrl:
+              typeof payload.photoUrl ===
+              "string"
+                ? payload.photoUrl
+                : null,
+
+            createdAt:
+              serverTimestamp(),
+
+            updatedAt:
+              serverTimestamp(),
+
+            rewardHistory: []
+          }
+        );
+
+        // ----------------------------------------------------
+        // KP TRANSACTION HISTORY
+        // ----------------------------------------------------
+
+        if (
+          kpTransactionRef &&
+          askerId
+        ) {
+          transaction.set(
+            kpTransactionRef,
+            {
+              userId:
+                askerId,
+
+              type:
+                KP_TRANSACTION_TYPES.DOUBT_STAKE,
+
+              amount:
+                -points,
+
+              title:
+                "Doubt Stake",
+
+              description:
+                `You staked ${points} KP to raise a ${subject} doubt.`,
+
+              doubtId:
+                doubtRef.id,
+
+              balanceAfter:
+                newBalance,
+
+              metadata: {
+                subject,
+                classLevel,
+                doubtText:
+                  text.slice(0, 120)
+              },
+
+              createdAt:
+                serverTimestamp()
+            }
+          );
+        }
+      }
+    );
+
+    return {
+      id: doubtRef.id,
+
+      askerId,
+      askerName,
+
+      text,
+      subject,
+      classLevel,
+
+      stakedPoints:
+        points,
+
+      remainingPoints:
+        points,
+
+      awardedStars: 0,
+
+      rewardedPoints: 0,
+
+      status: "open",
+
+      photoUrl:
+        typeof payload.photoUrl ===
+        "string"
+          ? payload.photoUrl
+          : null,
+
+      xpAdded:
+        Number(
+          XP_REWARDS.RAISE_DOUBT ?? 0
+        )
+    };
+  }
+
+  // ==========================================================
+  // MOCK
+  // ==========================================================
+
+  if (
+    typeof mockStore.createDoubt ===
+    "function"
+  ) {
+    return await mockStore.createDoubt({
+      askerId,
+      askerName,
       text,
       subject,
       classLevel,
       stakedPoints: points,
-      status: 'open',
-      solverId: null,
-      solverName: null,
-      createdAt: serverTimestamp(),
-      resolvedAt: null
-    };
-    const doubtDocRef = await addDoc(collection(db, 'doubts'), doubtData);
-    return { id: doubtDocRef.id, ...doubtData };
+      photoUrl:
+        typeof payload.photoUrl ===
+        "string"
+          ? payload.photoUrl
+          : null
+    });
   }
 
-  // --- Mock Mode ---
-  const users = mockStore.getStoredUsers();
-  const uIndex = users.findIndex(u => u.uid === user.uid);
-  if (uIndex !== -1) {
-    users[uIndex].kpBalance -= points;
-    mockStore.saveUsers(users);
-  }
-
-  const doubts = mockStore.getStoredDoubts();
-  const newDoubt = {
-    id: 'doubt_' + Date.now(),
-    askerId: user.uid,
-    askerName: user.name,
-    text,
-    subject,
-    classLevel,
-    stakedPoints: points,
-    status: 'open',
-    solverId: null,
-    solverName: null,
-    createdAt: new Date().toISOString(),
-    resolvedAt: null
-  };
-  doubts.unshift(newDoubt);
-  mockStore.saveDoubts(doubts);
-  return newDoubt;
+  throw new Error(
+    "No database is configured. Please configure Firebase."
+  );
 };
 
-/**
- * Subscribe to doubts list with optional filtering
- */
-export const subscribeToDoubts = (filters, callback) => {
-  if (isFirebaseConfigured && db) {
-    let q = collection(db, 'doubts');
-    const constraints = [orderBy('createdAt', 'desc')];
-    if (filters?.subject && filters.subject !== 'all') {
-      constraints.push(where('subject', '==', filters.subject));
-    }
-    if (filters?.classLevel && filters.classLevel !== 'all') {
-      constraints.push(where('classLevel', '==', filters.classLevel));
-    }
-    if (filters?.status && filters.status !== 'all') {
-      constraints.push(where('status', '==', filters.status));
-    }
-    
-    // Note: in Firestore, compound queries with range/order might require an index,
-    // so we handle client-side sorting/filtering gracefully if composite fails.
-    const unsubscribe = onSnapshot(collection(db, 'doubts'), (snapshot) => {
-      let docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      if (filters?.subject && filters.subject !== 'all') {
-        docs = docs.filter(d => d.subject?.toLowerCase() === filters.subject.toLowerCase());
-      }
-      if (filters?.classLevel && filters.classLevel !== 'all') {
-        docs = docs.filter(d => d.classLevel?.toLowerCase() === filters.classLevel.toLowerCase());
-      }
-      if (filters?.status && filters.status !== 'all') {
-        docs = docs.filter(d => d.status === filters.status);
-      }
-      // Sort newest first
-      docs.sort((a, b) => {
-        const timeA = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(a.createdAt || 0);
-        const timeB = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(b.createdAt || 0);
-        return timeB - timeA;
-      });
-      callback(docs);
-    }, (error) => {
-      console.error('Firestore doubts subscription error:', error);
-    });
+// ============================================================
+// SUBSCRIBE TO ALL DOUBTS
+// ============================================================
+
+export const subscribeToDoubts = (
+  filters = {},
+  callback
+) => {
+  if (
+    isFirebaseConfigured &&
+    db
+  ) {
+    const doubtsRef =
+      collection(
+        db,
+        "doubts"
+      );
+
+    const doubtsQuery =
+      query(
+        doubtsRef,
+        orderBy(
+          "createdAt",
+          "desc"
+        )
+      );
+
+    const unsubscribe =
+      onSnapshot(
+        doubtsQuery,
+
+        (snapshot) => {
+          let doubts =
+            snapshot.docs.map(
+              (document) => ({
+                id: document.id,
+                ...document.data()
+              })
+            );
+
+          if (
+            filters.subject &&
+            filters.subject !== "all"
+          ) {
+            doubts =
+              doubts.filter(
+                (doubt) =>
+                  String(
+                    doubt.subject || ""
+                  ).toLowerCase() ===
+                  String(
+                    filters.subject
+                  ).toLowerCase()
+              );
+          }
+
+          if (
+            filters.classLevel &&
+            filters.classLevel !== "all"
+          ) {
+            doubts =
+              doubts.filter(
+                (doubt) =>
+                  String(
+                    doubt.classLevel || ""
+                  ).toLowerCase() ===
+                  String(
+                    filters.classLevel
+                  ).toLowerCase()
+              );
+          }
+
+          if (
+            filters.status &&
+            filters.status !== "all"
+          ) {
+            doubts =
+              doubts.filter(
+                (doubt) =>
+                  String(
+                    doubt.status || "open"
+                  ).toLowerCase() ===
+                  String(
+                    filters.status
+                  ).toLowerCase()
+              );
+          }
+
+          doubts =
+            sortDoubtsForFeed(
+              doubts
+            );
+
+          callback(doubts);
+        },
+
+        (error) => {
+          console.error(
+            "subscribeToDoubts error:",
+            error
+          );
+
+          callback([]);
+        }
+      );
 
     return unsubscribe;
   }
 
-  // --- Mock Mode ---
-  const emitFiltered = () => {
-    let doubts = mockStore.getStoredDoubts();
-    if (filters?.subject && filters.subject !== 'all') {
-      doubts = doubts.filter(d => d.subject.toLowerCase() === filters.subject.toLowerCase());
-    }
-    if (filters?.classLevel && filters.classLevel !== 'all') {
-      doubts = doubts.filter(d => d.classLevel.toLowerCase() === filters.classLevel.toLowerCase());
-    }
-    if (filters?.status && filters.status !== 'all') {
-      doubts = doubts.filter(d => d.status === filters.status);
-    }
-    doubts.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    callback([...doubts]);
-  };
+  if (
+    typeof mockStore.subscribeToDoubts ===
+    "function"
+  ) {
+    return mockStore.subscribeToDoubts(
+      filters,
+      callback
+    );
+  }
 
-  emitFiltered();
-  const unsub = mockStore.subscribeToStorageEvents((event) => {
-    if (event.type === 'DOUBTS_UPDATED' || event.type === 'RESET_DATA') {
-      emitFiltered();
-    }
-  });
+  callback([]);
 
-  return unsub;
+  return () => {};
 };
 
-/**
- * Subscribe to a single doubt document
- */
-export const subscribeToDoubt = (doubtId, callback) => {
-  if (isFirebaseConfigured && db) {
-    const docRef = doc(db, 'doubts', doubtId);
-    return onSnapshot(docRef, (snap) => {
-      if (snap.exists()) {
-        callback({ id: snap.id, ...snap.data() });
-      } else {
+// ============================================================
+// SUBSCRIBE TO SINGLE DOUBT
+// ============================================================
+
+export const subscribeToDoubt = (
+  doubtId,
+  callback
+) => {
+  const cleanDoubtId =
+    normalizeDoubtId(doubtId);
+
+  if (!cleanDoubtId) {
+    callback(null);
+    return () => {};
+  }
+
+  if (
+    isFirebaseConfigured &&
+    db
+  ) {
+    const doubtRef =
+      doc(
+        db,
+        "doubts",
+        cleanDoubtId
+      );
+
+    return onSnapshot(
+      doubtRef,
+
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          callback(null);
+          return;
+        }
+
+        callback({
+          id: snapshot.id,
+          ...snapshot.data()
+        });
+      },
+
+      (error) => {
+        console.error(
+          "subscribeToDoubt error:",
+          error
+        );
+
         callback(null);
       }
-    });
+    );
   }
 
-  // --- Mock Mode ---
-  const emitDoubt = () => {
-    const doubts = mockStore.getStoredDoubts();
-    const doubt = doubts.find(d => d.id === doubtId);
-    callback(doubt ? { ...doubt } : null);
-  };
+  if (
+    typeof mockStore.subscribeToDoubt ===
+    "function"
+  ) {
+    return mockStore.subscribeToDoubt(
+      cleanDoubtId,
+      callback
+    );
+  }
 
-  emitDoubt();
-  const unsub = mockStore.subscribeToStorageEvents((event) => {
-    if (event.type === 'DOUBTS_UPDATED' || event.type === 'RESET_DATA') {
-      emitDoubt();
-    }
-  });
-  return unsub;
+  callback(null);
+
+  return () => {};
 };
 
-/**
- * Claim or set solver in progress for a doubt
- */
-export const claimDoubt = async (doubtId, solverUser) => {
-  if (isFirebaseConfigured && db) {
-    const doubtRef = doc(db, 'doubts', doubtId);
-    const doubtSnap = await getDoc(doubtRef);
-    if (!doubtSnap.exists()) throw new Error('Doubt not found');
-    const data = doubtSnap.data();
+// ============================================================
+// CLAIM DOUBT
+// ============================================================
 
-    // If already in progress with someone else or resolved, do nothing
-    if (data.status === 'open') {
-      await updateDoc(doubtRef, {
-        status: 'in_progress',
-        solverId: solverUser.uid,
-        solverName: solverUser.name
-      });
-    }
-    return;
+export const claimDoubt = async (
+  doubtId,
+  solver
+) => {
+  const cleanDoubtId =
+    normalizeDoubtId(doubtId);
+
+  if (!cleanDoubtId) {
+    throw new Error(
+      "Invalid doubt ID."
+    );
   }
 
-  // --- Mock Mode ---
-  const doubts = mockStore.getStoredDoubts();
-  const idx = doubts.findIndex(d => d.id === doubtId);
-  if (idx !== -1 && doubts[idx].status === 'open') {
-    doubts[idx].status = 'in_progress';
-    doubts[idx].solverId = solverUser.uid;
-    doubts[idx].solverName = solverUser.name;
-    mockStore.saveDoubts(doubts);
+  if (!solver) {
+    throw new Error(
+      "Solver information is required."
+    );
   }
+
+  const solverId =
+    solver.uid ||
+    solver.id ||
+    solver.userId ||
+    solver.solverId ||
+    "";
+
+  const solverName =
+    solver.name ||
+    solver.displayName ||
+    solver.fullName ||
+    solver.solverName ||
+    "Scholar";
+
+  if (!solverId) {
+    throw new Error(
+      "Unable to identify the solver."
+    );
+  }
+
+  // ==========================================================
+  // FIREBASE
+  // ==========================================================
+
+  if (
+    isFirebaseConfigured &&
+    db
+  ) {
+    const doubtRef =
+      doc(
+        db,
+        "doubts",
+        cleanDoubtId
+      );
+
+    await runTransaction(
+      db,
+      async (transaction) => {
+        const snapshot =
+          await transaction.get(
+            doubtRef
+          );
+
+        if (!snapshot.exists()) {
+          throw new Error(
+            "Doubt not found."
+          );
+        }
+
+        const doubt =
+          snapshot.data();
+
+        if (
+          doubt.status ===
+          "resolved"
+        ) {
+          throw new Error(
+            "This doubt has already been resolved."
+          );
+        }
+
+        const remaining =
+          Number(
+            doubt.remainingPoints ??
+            doubt.stakedPoints ??
+            0
+          );
+
+        if (remaining <= 0) {
+          throw new Error(
+            "No reward is remaining for this doubt."
+          );
+        }
+
+        if (
+          doubt.currentSolverId &&
+          doubt.currentSolverId !==
+            solverId
+        ) {
+          throw new Error(
+            "This doubt is currently being handled by another solver."
+          );
+        }
+
+        transaction.update(
+          doubtRef,
+          {
+            status:
+              "in_progress",
+
+            currentSolverId:
+              solverId,
+
+            currentSolverName:
+              solverName,
+
+            updatedAt:
+              serverTimestamp()
+          }
+        );
+      }
+    );
+
+    return {
+      success: true,
+      doubtId: cleanDoubtId,
+      solverId,
+      solverName
+    };
+  }
+
+  // ==========================================================
+  // MOCK
+  // ==========================================================
+
+  if (
+    typeof mockStore.claimDoubt ===
+    "function"
+  ) {
+    return mockStore.claimDoubt(
+      cleanDoubtId,
+      solver
+    );
+  }
+
+  throw new Error(
+    "Database is not configured."
+  );
 };
 
-/**
- * Subscribe to messages in a doubt chat
- */
-export const subscribeToMessages = (doubtId, callback) => {
-  if (isFirebaseConfigured && db) {
-    const messagesCol = collection(db, 'doubts', doubtId, 'messages');
-    const q = query(messagesCol, orderBy('sentAt', 'asc'));
-    return onSnapshot(q, (snapshot) => {
-      const msgs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      callback(msgs);
-    }, (error) => {
-      console.error('Firestore messages subscription error:', error);
-    });
+// ============================================================
+// SUBSCRIBE TO MESSAGES
+// ============================================================
+
+export const subscribeToMessages = (
+  doubtId,
+  callback
+) => {
+  const cleanDoubtId =
+    normalizeDoubtId(doubtId);
+
+  if (!cleanDoubtId) {
+    callback([]);
+    return () => {};
   }
 
-  // --- Mock Mode ---
-  const emitMsgs = () => {
-    const msgs = mockStore.getStoredMessages(doubtId);
-    callback([...msgs]);
-  };
+  if (
+    isFirebaseConfigured &&
+    db
+  ) {
+    const messagesRef =
+      collection(
+        db,
+        "doubts",
+        cleanDoubtId,
+        "messages"
+      );
 
-  emitMsgs();
-  const unsub = mockStore.subscribeToStorageEvents((event) => {
-    if ((event.type === 'MESSAGES_UPDATED' && event.doubtId === doubtId) || event.type === 'RESET_DATA') {
-      emitMsgs();
-    }
-  });
-  return unsub;
+    const messagesQuery =
+      query(
+        messagesRef,
+        orderBy(
+          "createdAt",
+          "asc"
+        )
+      );
+
+    return onSnapshot(
+      messagesQuery,
+
+      (snapshot) => {
+        const messages =
+          snapshot.docs.map(
+            (document) => ({
+              id: document.id,
+              ...document.data()
+            })
+          );
+
+        callback(messages);
+      },
+
+      (error) => {
+        console.error(
+          "subscribeToMessages error:",
+          error
+        );
+
+        callback([]);
+      }
+    );
+  }
+
+  if (
+    typeof mockStore.subscribeToMessages ===
+    "function"
+  ) {
+    return mockStore.subscribeToMessages(
+      cleanDoubtId,
+      callback
+    );
+  }
+
+  callback([]);
+
+  return () => {};
 };
 
-/**
- * Send a message in a doubt chat
- */
-export const sendMessage = async (doubtId, { senderId, senderName, text }) => {
-  if (!text || !text.trim()) return;
+// ============================================================
+// SEND MESSAGE
+// ============================================================
 
-  if (isFirebaseConfigured && db) {
-    const messagesCol = collection(db, 'doubts', doubtId, 'messages');
-    await addDoc(messagesCol, {
+export const sendMessage = async ({
+  doubtId,
+  senderId,
+  senderName,
+  text = "",
+  photoFile = null,
+  videoFile = null
+}) => {
+  const cleanDoubtId =
+    normalizeDoubtId(doubtId);
+
+  if (!cleanDoubtId) {
+    console.error(
+      "sendMessage received invalid doubtId:",
+      doubtId
+    );
+
+    throw new Error(
+      "Invalid doubt ID."
+    );
+  }
+
+  const cleanText =
+    typeof text === "string"
+      ? text.trim()
+      : "";
+
+  if (
+    !cleanText &&
+    !photoFile &&
+    !videoFile
+  ) {
+    throw new Error(
+      "Message cannot be empty."
+    );
+  }
+
+  // ==========================================================
+  // FIREBASE
+  // ==========================================================
+
+  if (
+    isFirebaseConfigured &&
+    db
+  ) {
+    let photoUrl = null;
+    let videoUrl = null;
+
+    if (photoFile) {
+      validateFile(
+        photoFile,
+        "image"
+      );
+
+      photoUrl =
+        await uploadAttachment(
+          photoFile,
+          "chat-images",
+          senderId
+        );
+    }
+
+    if (videoFile) {
+      validateFile(
+        videoFile,
+        "video"
+      );
+
+      videoUrl =
+        await uploadAttachment(
+          videoFile,
+          "chat-videos",
+          senderId
+        );
+    }
+
+    const messagesRef =
+      collection(
+        db,
+        "doubts",
+        cleanDoubtId,
+        "messages"
+      );
+
+    const message = {
+      senderId:
+        senderId || "",
+
+      senderName:
+        senderName || "Student",
+
+      text:
+        cleanText,
+
+      photoUrl,
+      videoUrl,
+
+      createdAt:
+        serverTimestamp()
+    };
+
+    const messageRef =
+      await addDoc(
+        messagesRef,
+        message
+      );
+
+    return {
+      id: messageRef.id,
+      ...message
+    };
+  }
+
+  // ==========================================================
+  // MOCK
+  // ==========================================================
+
+  if (
+    typeof mockStore.sendMessage ===
+    "function"
+  ) {
+    return mockStore.sendMessage({
+      doubtId:
+        cleanDoubtId,
+
       senderId,
       senderName,
-      text: text.trim(),
-      sentAt: serverTimestamp()
+
+      text:
+        cleanText,
+
+      photoFile,
+      videoFile
     });
-    return;
   }
 
-  // --- Mock Mode ---
-  const newMsg = {
-    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
-    senderId,
-    senderName,
-    text: text.trim(),
-    sentAt: new Date().toISOString()
-  };
-  mockStore.saveMessage(doubtId, newMsg);
+  throw new Error(
+    "Database is not configured."
+  );
 };
 
-/**
- * Resolve doubt and execute Knowledge Points transfer transaction
- * Transfers staked KP + 5 KP bonus to solver
- * Updates asker totalAccepted + reputation
- * Updates solver totalSolved + reputation
- */
-export const resolveDoubt = async (doubtId, askerUser, solverId) => {
-  const BONUS_KP = 5; // Hackathon platform incentive bonus!
+// ============================================================
+// RESOLVE DOUBT
+// ============================================================
 
-  if (isFirebaseConfigured && db) {
-    const doubtRef = doc(db, 'doubts', doubtId);
-    const askerRef = doc(db, 'users', askerUser.uid);
-    const solverRef = doc(db, 'users', solverId);
+export const resolveDoubt = async (
+  doubtId,
+  solverId,
+  awardedStars
+) => {
+  const cleanDoubtId =
+    normalizeDoubtId(doubtId);
 
-    await runTransaction(db, async (transaction) => {
-      const doubtDoc = await transaction.get(doubtRef);
-      if (!doubtDoc.exists()) throw new Error('Doubt does not exist');
-      
-      const doubtData = doubtDoc.data();
-      if (doubtData.status === 'resolved') {
-        throw new Error('Doubt is already resolved');
-      }
-
-      const solverDoc = await transaction.get(solverRef);
-      if (!solverDoc.exists()) throw new Error('Solver user not found');
-      const solverData = solverDoc.data();
-
-      const askerDoc = await transaction.get(askerRef);
-      const askerData = askerDoc.exists() ? askerDoc.data() : askerUser;
-
-      const stakedPoints = Number(doubtData.stakedPoints) || 0;
-      const totalEarned = stakedPoints + BONUS_KP;
-
-      // 1. Update solver balance & stats
-      transaction.update(solverRef, {
-        kpBalance: (solverData.kpBalance || 0) + totalEarned,
-        totalSolved: (solverData.totalSolved || 0) + 1,
-        reputation: (solverData.reputation || 0) + 5
-      });
-
-      // 2. Update asker stats
-      transaction.update(askerRef, {
-        totalAccepted: (askerData.totalAccepted || 0) + 1,
-        reputation: (askerData.reputation || 0) + 2
-      });
-
-      // 3. Mark doubt as resolved
-      transaction.update(doubtRef, {
-        status: 'resolved',
-        solverId: solverId,
-        resolvedAt: serverTimestamp()
-      });
-    });
-
-    return { success: true, bonusEarned: BONUS_KP };
+  if (!cleanDoubtId) {
+    throw new Error(
+      "Invalid doubt ID."
+    );
   }
 
-  // --- Mock Mode Transaction ---
-  const doubts = mockStore.getStoredDoubts();
-  const dIndex = doubts.findIndex(d => d.id === doubtId);
-  if (dIndex === -1) throw new Error('Doubt not found');
-  if (doubts[dIndex].status === 'resolved') throw new Error('Doubt is already resolved');
-
-  const users = mockStore.getStoredUsers();
-  const sIndex = users.findIndex(u => u.uid === solverId);
-  const aIndex = users.findIndex(u => u.uid === askerUser.uid);
-
-  if (sIndex === -1) throw new Error('Solver user not found');
-
-  const stakedPoints = Number(doubts[dIndex].stakedPoints) || 0;
-  const totalEarned = stakedPoints + BONUS_KP;
-
-  // Credit solver
-  users[sIndex].kpBalance += totalEarned;
-  users[sIndex].totalSolved = (users[sIndex].totalSolved || 0) + 1;
-  users[sIndex].reputation = (users[sIndex].reputation || 0) + 5;
-
-  // Update asker stats
-  if (aIndex !== -1) {
-    users[aIndex].totalAccepted = (users[aIndex].totalAccepted || 0) + 1;
-    users[aIndex].reputation = (users[aIndex].reputation || 0) + 2;
+  if (!solverId) {
+    throw new Error(
+      "Solver ID is required."
+    );
   }
 
-  // Update doubt status
-  doubts[dIndex].status = 'resolved';
-  doubts[dIndex].solverId = solverId;
-  doubts[dIndex].resolvedAt = new Date().toISOString();
+  const numericStars =
+    Number(awardedStars);
 
-  mockStore.saveUsers(users);
-  mockStore.saveDoubts(doubts);
+  if (!Number.isFinite(numericStars)) {
+    throw new Error(
+      "Invalid star rating."
+    );
+  }
 
-  return { success: true, bonusEarned: BONUS_KP, totalEarned };
+  const newStars =
+    Math.max(
+      1,
+      Math.min(
+        5,
+        numericStars
+      )
+    );
+
+  // ==========================================================
+  // FIREBASE
+  // ==========================================================
+
+  if (
+    isFirebaseConfigured &&
+    db
+  ) {
+    const doubtRef =
+      doc(
+        db,
+        "doubts",
+        cleanDoubtId
+      );
+
+    // --------------------------------------------------------
+    // KP REWARD HISTORY DOCUMENT
+    // --------------------------------------------------------
+    //
+    // One document per resolve attempt.
+    //
+    // The document is only written when rewardThisSolve > 0.
+    //
+    // Creating the reference before runTransaction means
+    // Firestore transaction retries still use the same ID.
+    //
+
+    const kpTransactionRef =
+      doc(
+        collection(
+          db,
+          "kpTransactions"
+        )
+      );
+
+    const result =
+      await runTransaction(
+        db,
+        async (transaction) => {
+
+          // ==================================================
+          // READ DOUBT
+          // ==================================================
+
+          const doubtSnapshot =
+            await transaction.get(
+              doubtRef
+            );
+
+          if (
+            !doubtSnapshot.exists()
+          ) {
+            throw new Error(
+              "Doubt not found."
+            );
+          }
+
+          const doubt =
+            doubtSnapshot.data();
+
+          // --------------------------------------------------
+          // ALREADY FULLY RESOLVED
+          // --------------------------------------------------
+
+          if (
+            doubt.status ===
+              "resolved" &&
+            Number(
+              doubt.remainingPoints ??
+              0
+            ) <= 0
+          ) {
+            throw new Error(
+              "This doubt has already been fully resolved."
+            );
+          }
+
+          // --------------------------------------------------
+          // CURRENT SOLVER
+          // --------------------------------------------------
+
+          if (
+            doubt.currentSolverId &&
+            doubt.currentSolverId !==
+              solverId
+          ) {
+            throw new Error(
+              "Only the current solver can resolve this doubt."
+            );
+          }
+
+          // --------------------------------------------------
+          // CURRENT VALUES
+          // --------------------------------------------------
+
+          const originalPoints =
+            Number(
+              doubt.stakedPoints ?? 0
+            );
+
+          const currentRewardedPoints =
+            Number(
+              doubt.rewardedPoints ?? 0
+            );
+
+          const currentStars =
+            Number(
+              doubt.awardedStars ?? 0
+            );
+
+          const currentRemaining =
+            Number(
+              doubt.remainingPoints ??
+              (
+                originalPoints -
+                currentRewardedPoints
+              )
+            );
+
+          if (
+            originalPoints <= 0
+          ) {
+            throw new Error(
+              "Invalid doubt bounty."
+            );
+          }
+
+          // ==================================================
+          // STAR CALCULATION
+          // ==================================================
+
+          const finalStars =
+            Math.max(
+              currentStars,
+              newStars
+            );
+
+          const targetReward =
+            finalStars >= 5
+              ? originalPoints
+              : Math.floor(
+                  (
+                    originalPoints *
+                    finalStars
+                  ) / 5
+                );
+
+          // --------------------------------------------------
+          // ONLY PAY NEW REWARD
+          // --------------------------------------------------
+
+          let rewardThisSolve =
+            targetReward -
+            currentRewardedPoints;
+
+          rewardThisSolve =
+            Math.max(
+              0,
+              Math.min(
+                rewardThisSolve,
+                currentRemaining
+              )
+            );
+
+          const newRewardedPoints =
+            currentRewardedPoints +
+            rewardThisSolve;
+
+          const newRemainingPoints =
+            Math.max(
+              0,
+              originalPoints -
+                newRewardedPoints
+            );
+
+          const fullyResolved =
+            finalStars >= 5 ||
+            newRemainingPoints <= 0;
+
+          const newStatus =
+            fullyResolved
+              ? "resolved"
+              : "open";
+
+          // ==================================================
+          // READ SOLVER
+          // ==================================================
+
+          const solverRef =
+            doc(
+              db,
+              "users",
+              solverId
+            );
+
+          const solverSnapshot =
+            await transaction.get(
+              solverRef
+            );
+
+          const solverData =
+            solverSnapshot.exists()
+              ? solverSnapshot.data()
+              : {};
+
+          // ==================================================
+          // READ ASKER
+          // ==================================================
+
+          let askerRef = null;
+          let askerSnapshot = null;
+
+          if (
+            fullyResolved &&
+            doubt.askerId &&
+            doubt.askerId !==
+              solverId
+          ) {
+            askerRef =
+              doc(
+                db,
+                "users",
+                doubt.askerId
+              );
+
+            askerSnapshot =
+              await transaction.get(
+                askerRef
+              );
+          }
+
+          // ==================================================
+          // SOLVER CURRENT STATS
+          // ==================================================
+
+          const oldSolverKP =
+            Number(
+              solverData.kpBalance ?? 0
+            );
+
+          const oldReputation =
+            Number(
+              solverData.reputation ?? 0
+            );
+
+          const oldTotalSolved =
+            Number(
+              solverData.totalSolved ?? 0
+            );
+
+          const oldXP =
+            Number(
+              solverData.xp ?? 0
+            );
+
+          const oldFiveStarRatings =
+            Number(
+              solverData.fiveStarRatings ?? 0
+            );
+
+          const oldAchievements =
+            solverData.achievements &&
+            typeof solverData.achievements ===
+              "object" &&
+            !Array.isArray(
+              solverData.achievements
+            )
+              ? solverData.achievements
+              : {};
+
+          // ==================================================
+          // BASE XP
+          // ==================================================
+
+          const solveXP =
+            Number(
+              XP_REWARDS.SOLVE_DOUBT ?? 0
+            );
+
+          const xpThisSolve =
+            rewardThisSolve > 0
+              ? solveXP
+              : 0;
+
+          const xpAfterSolve =
+            oldXP +
+            xpThisSolve;
+
+          // ==================================================
+          // SOLVE COUNT
+          // ==================================================
+
+          const solvedThisTime =
+            rewardThisSolve > 0;
+
+          const newTotalSolved =
+            oldTotalSolved +
+            (
+              solvedThisTime
+                ? 1
+                : 0
+            );
+
+          // ==================================================
+          // FIVE STAR COUNT
+          // ==================================================
+
+          const fiveStarThisTime =
+            solvedThisTime &&
+            finalStars >= 5;
+
+          const newFiveStarRatings =
+            oldFiveStarRatings +
+            (
+              fiveStarThisTime
+                ? 1
+                : 0
+            );
+
+          // ==================================================
+          // BASE LEVEL
+          // ==================================================
+
+          const baseLevel =
+            getLevelFromXP(
+              xpAfterSolve
+            );
+
+          // ==================================================
+          // ACHIEVEMENT CHECK
+          // ==================================================
+
+          const achievementResult =
+            calculateAchievementUpdate(
+              {
+                xp:
+                  xpAfterSolve,
+
+                level:
+                  baseLevel.level,
+
+                doubtsRaised:
+                  Number(
+                    solverData.doubtsRaised ?? 0
+                  ),
+
+                totalSolved:
+                  newTotalSolved,
+
+                fiveStarRatings:
+                  newFiveStarRatings,
+
+                achievements:
+                  oldAchievements
+              },
+              serverTimestamp()
+            );
+
+          // ==================================================
+          // FINAL XP + LEVEL
+          // ==================================================
+
+          const newSolverXP =
+            achievementResult.xp;
+
+          const newSolverLevel =
+            getLevelFromXP(
+              newSolverXP
+            );
+
+          // ==================================================
+          // NEW SOLVER KP BALANCE
+          // ==================================================
+
+          const newSolverKP =
+            oldSolverKP +
+            rewardThisSolve;
+
+          // ==================================================
+          // SOLVER UPDATE
+          // ==================================================
+
+          const solverUpdate = {
+            kpBalance:
+              newSolverKP,
+
+            reputation:
+              oldReputation +
+              (
+                rewardThisSolve > 0
+                  ? 1
+                  : 0
+              ),
+
+            xp:
+              newSolverXP,
+
+            level:
+              newSolverLevel.level,
+
+            levelName:
+              newSolverLevel.name,
+
+            totalSolved:
+              newTotalSolved,
+
+            fiveStarRatings:
+              newFiveStarRatings,
+
+            achievements:
+              achievementResult.achievements,
+
+            updatedAt:
+              serverTimestamp()
+          };
+
+          // ==================================================
+          // REWARD HISTORY
+          // ==================================================
+
+          const oldHistory =
+            Array.isArray(
+              doubt.rewardHistory
+            )
+              ? doubt.rewardHistory
+              : [];
+
+          const rewardEntry = {
+            solverId,
+
+            stars:
+              finalStars,
+
+            points:
+              rewardThisSolve,
+
+            rewardedPointsTotal:
+              newRewardedPoints,
+
+            remainingPoints:
+              newRemainingPoints,
+
+            createdAt:
+              new Date().toISOString()
+          };
+
+          const rewardHistory = [
+            ...oldHistory,
+            rewardEntry
+          ];
+
+          // ==================================================
+          // DOUBT UPDATE
+          // ==================================================
+
+          const doubtUpdate = {
+            awardedStars:
+              finalStars,
+
+            rewardedPoints:
+              newRewardedPoints,
+
+            remainingPoints:
+              newRemainingPoints,
+
+            status:
+              newStatus,
+
+            rewardHistory,
+
+            updatedAt:
+              serverTimestamp()
+          };
+
+          if (!fullyResolved) {
+            doubtUpdate.currentSolverId =
+              null;
+
+            doubtUpdate.currentSolverName =
+              null;
+          }
+
+          if (fullyResolved) {
+            doubtUpdate.currentSolverId =
+              solverId;
+          }
+
+          // ==================================================
+          // ASKER UPDATE
+          // ==================================================
+
+          let askerUpdate = null;
+
+          if (
+            askerSnapshot &&
+            askerSnapshot.exists()
+          ) {
+            const askerData =
+              askerSnapshot.data();
+
+            const askerReputation =
+              Number(
+                askerData.reputation ?? 0
+              );
+
+            const totalAccepted =
+              Number(
+                askerData.totalAccepted ?? 0
+              );
+
+            askerUpdate = {
+              reputation:
+                askerReputation + 1,
+
+              totalAccepted:
+                totalAccepted + 1,
+
+              updatedAt:
+                serverTimestamp()
+            };
+          }
+
+          // ==================================================
+          // ALL WRITES
+          // ==================================================
+
+          transaction.set(
+            solverRef,
+            solverUpdate,
+            {
+              merge: true
+            }
+          );
+
+          transaction.update(
+            doubtRef,
+            doubtUpdate
+          );
+
+          if (
+            askerRef &&
+            askerUpdate
+          ) {
+            transaction.update(
+              askerRef,
+              askerUpdate
+            );
+          }
+
+          // ==================================================
+          // KP TRANSACTION HISTORY
+          // ==================================================
+          //
+          // Only create history when the solver actually
+          // receives KP.
+          //
+          // Example:
+          //
+          // 20 KP doubt
+          // 1 star -> +4 KP
+          // 2 stars -> +4 additional KP
+          // 5 stars -> remaining KP
+          //
+          // Each actual reward is recorded separately.
+          //
+
+          if (
+            rewardThisSolve > 0
+          ) {
+            transaction.set(
+              kpTransactionRef,
+              {
+                userId:
+                  solverId,
+
+                type:
+                  KP_TRANSACTION_TYPES.SOLVER_REWARD,
+
+                amount:
+                  rewardThisSolve,
+
+                title:
+                  "Solver Reward",
+
+                description:
+                  `You earned ${rewardThisSolve} KP for solving a doubt with ${finalStars} star${finalStars === 1 ? "" : "s"}.`,
+
+                doubtId:
+                  cleanDoubtId,
+
+                balanceAfter:
+                  newSolverKP,
+
+                metadata: {
+                  stars:
+                    finalStars,
+
+                  rewardThisSolve,
+
+                  totalRewarded:
+                    newRewardedPoints,
+
+                  remainingPoints:
+                    newRemainingPoints,
+
+                  fullyResolved
+                },
+
+                createdAt:
+                  serverTimestamp()
+              }
+            );
+          }
+
+          // ==================================================
+          // RETURN RESULT
+          // ==================================================
+
+          return {
+            success: true,
+
+            rewardThisSolve,
+
+            totalRewarded:
+              newRewardedPoints,
+
+            remainingPoints:
+              newRemainingPoints,
+
+            awardedStars:
+              finalStars,
+
+            status:
+              newStatus,
+
+            fullyResolved,
+
+            xpAdded:
+              xpThisSolve,
+
+            achievementXP:
+              achievementResult.achievementXP,
+
+            unlockedAchievements:
+              achievementResult.unlockedAchievements,
+
+            totalXP:
+              newSolverXP,
+
+            level:
+              newSolverLevel.level,
+
+            levelName:
+              newSolverLevel.name
+          };
+        }
+      );
+
+    return result;
+  }
+
+  // ==========================================================
+  // MOCK MODE
+  // ==========================================================
+
+  if (
+    typeof mockStore.resolveDoubt ===
+    "function"
+  ) {
+    return mockStore.resolveDoubt(
+      cleanDoubtId,
+      solverId,
+      newStars
+    );
+  }
+
+  throw new Error(
+    "Database is not configured."
+  );
+};
+
+// ============================================================
+// DEFAULT EXPORT
+// ============================================================
+
+export default {
+  createDoubt,
+
+  subscribeToDoubts,
+
+  subscribeToDoubt,
+
+  subscribeToMessages,
+
+  sendMessage,
+
+  claimDoubt,
+
+  resolveDoubt,
+
+  getDoubtFeedPriority,
+
+  sortDoubtsForFeed
 };
