@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Peer-Earn 🎓🪙
 > **Decentralized Peer-to-Peer Academic Doubt-Solving & Learning Economy Platform**
 > *"Quora meets Duolingo for schools" — students learn by asking, and earn by helping.*
@@ -141,3 +142,7 @@ service cloud.firestore {
 4. **Verify Live KP Transfer**:
    - The doubt is marked **Resolved**.
    - Priya's wallet increases by **30 KP** (25 staked + 5 platform bonus), and her `totalSolved` count increments!
+=======
+# peer-earn
+Peer-Earn |Decentralized peer-to-Peer Learning with Earning  Platform
+>>>>>>> d70c2b5acd0456fc06d35dec05add0ec041266d7
